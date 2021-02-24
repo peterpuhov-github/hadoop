@@ -90,7 +90,6 @@ import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
-import org.apache.log4j.Level;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -98,6 +97,7 @@ import org.mockito.Mockito;
 import org.mockito.internal.stubbing.answers.ThrowsException;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
+import org.slf4j.event.Level;
 
 
 /**
@@ -839,10 +839,8 @@ public class TestDFSClientRetries {
   public void testGetFileChecksum() throws Exception {
     final String f = "/testGetFileChecksum";
     final Path p = new Path(f);
-    // HDFS-15461: the number of datanode is higher than the number of replicas.
-    //             That way when a DN fails, the pipeline can recover.
     final int numReplicas = 3;
-    final int numDatanodes = numReplicas + 1;
+    final int numDatanodes = numReplicas;
     final MiniDFSCluster cluster =
         new MiniDFSCluster.Builder(conf).numDataNodes(numDatanodes).build();
     try {
@@ -961,7 +959,7 @@ public class TestDFSClientRetries {
 
   public static void namenodeRestartTest(final Configuration conf,
       final boolean isWebHDFS) throws Exception {
-    GenericTestUtils.setLogLevel(DFSClient.LOG, Level.ALL);
+    GenericTestUtils.setLogLevel(DFSClient.LOG, Level.TRACE);
 
     final List<Exception> exceptions = new ArrayList<Exception>();
 

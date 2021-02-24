@@ -28,17 +28,26 @@ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.Capacity
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerQueueManager;
 import org.apache.hadoop.yarn.util.Records;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import static junit.framework.TestCase.*;
+import static junit.framework.TestCase.assertEquals;
+import static junit.framework.TestCase.assertNotNull;
+import static junit.framework.TestCase.assertNull;
+import static junit.framework.TestCase.assertTrue;
+import static junit.framework.TestCase.fail;
 import static org.apache.hadoop.yarn.server.resourcemanager.placement.FairQueuePlacementUtils.DOT;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
@@ -47,11 +56,15 @@ import static org.mockito.Mockito.when;
 public class TestCSMappingPlacementRule {
   private static final Logger LOG = LoggerFactory
       .getLogger(TestCSMappingPlacementRule.class);
+
+  @Rule
+  public TemporaryFolder folder = new TemporaryFolder();
+
   private Map<String, Set<String>> userGroups = ImmutableMap.of(
       "alice", ImmutableSet.of("p_alice", "user", "developer"),
       "bob", ImmutableSet.of("p_bob", "user", "developer"),
       "charlie", ImmutableSet.of("p_charlie", "user", "tester"),
-      "dave", ImmutableSet.of("user", "tester"),
+      "dave", ImmutableSet.of("user"),
       "emily", ImmutableSet.of("user", "tester", "developer")
   );
 
@@ -77,6 +90,7 @@ public class TestCSMappingPlacementRule {
         .withQueue("root.disambiguous.deep.disambiuser.disambi")
         .withQueue("root.disambiguous.deep.group.developer")
         .withManagedParentQueue("root.disambiguous.deep.dman")
+        .withDynamicParentQueue("root.dynamic")
         .build();
 
     when(queueManager.getQueue(isNull())).thenReturn(null);
@@ -138,8 +152,9 @@ public class TestCSMappingPlacementRule {
   private void assertReject(String message, CSMappingPlacementRule engine,
       ApplicationSubmissionContext asc, String user) {
     try {
-      engine.getPlacementForApp(asc, user);
-      fail(message);
+      ApplicationPlacementContext apc = engine.getPlacementForApp(asc, user);
+      fail("Unexpected queue result: " + apc.getFullQueuePath() + " - " +
+          message);
     } catch (YarnException e) {
       //To prevent PlacementRule chaining present in PlacementManager
       //when an application is rejected an exception is thrown to make sure
@@ -412,6 +427,55 @@ public class TestCSMappingPlacementRule {
 
   }
 
+  @Test
+  public void testSpecified() throws IOException {
+    ArrayList<MappingRule> rules = new ArrayList<>();
+    rules.add(
+        new MappingRule(
+            MappingRuleMatchers.createAllMatcher(),
+            (new MappingRuleActions.PlaceToQueueAction("%specified", true))
+                .setFallbackSkip()));
+
+    rules.add(
+        new MappingRule(
+            MappingRuleMatchers.createAllMatcher(),
+            (new MappingRuleActions.PlaceToQueueAction(
+                "root.ambiguous.group.tester", true))
+                .setFallbackSkip()));
+
+    rules.add(
+        new MappingRule(
+            MappingRuleMatchers.createAllMatcher(),
+            (new MappingRuleActions.RejectAction())
+                .setFallbackReject()));
+
+    CSMappingPlacementRule engine = setupEngine(true, rules);
+    ApplicationSubmissionContext appNoQueue = createApp("app");
+    ApplicationSubmissionContext appDefault = createApp("app", "default");
+    ApplicationSubmissionContext appRootDefault =
+        createApp("app", "root.default");
+    ApplicationSubmissionContext appBob =
+        createApp("app", "root.user.bob");
+
+    assertPlace("App with non specified queue should end up in " +
+        "'root.ambiguous.group.tester' because no queue was specified and " +
+        "this is the only rule matching the submission",
+        engine, appNoQueue, "alice", "root.ambiguous.group.tester");
+
+    assertPlace("App with specified 'default' should end up in " +
+            "'root.ambiguous.group.tester' because 'default' is the same as " +
+            "no queue being specified and this is the only rule matching the " +
+            "submission ",
+        engine, appDefault, "alice", "root.ambiguous.group.tester");
+
+    assertPlace("App with specified root.default should end up in " +
+            "'root.default' because root.default is specifically provided",
+        engine, appRootDefault, "alice", "root.default");
+
+    assertPlace("App with specified queue should end up in the specified " +
+        "queue 'root.user.bob'", engine, appBob, "alice", "root.user.bob");
+  }
+
   private MappingRule createGroupMapping(String group, String queue) {
     MappingRuleMatcher matcher = MappingRuleMatchers.createUserGroupMatcher(group);
     MappingRuleAction action =
@@ -421,14 +485,36 @@ public class TestCSMappingPlacementRule {
   }
 
   @Test
-  public void testGroupMatching() throws IOException {
+  public void testGroupTargetMatching() throws IOException {
     ArrayList<MappingRule> rules = new ArrayList<>();
 
-    rules.add(createGroupMapping("p_alice", "root.man.p_alice"));
-    rules.add(createGroupMapping("developer", "root.man.developer"));
+    rules.add(
+        new MappingRule(
+            MappingRuleMatchers.createUserMatcher("alice"),
+            (new MappingRuleActions.PlaceToQueueAction(
+                "root.man.%primary_group", true))
+                .setFallbackReject()));
 
-    //everybody is in the user group, this should catch all
-    rules.add(createGroupMapping("user", "root.man.user"));
+    rules.add(
+        new MappingRule(
+            MappingRuleMatchers.createUserMatcher("bob"),
+            (new MappingRuleActions.PlaceToQueueAction(
+                "root.dynamic.%secondary_group.%user", true))
+                .setFallbackReject()));
+
+    rules.add(
+        new MappingRule(
+            MappingRuleMatchers.createUserMatcher("charlie"),
+            (new MappingRuleActions.PlaceToQueueAction(
+                "root.man.%secondary_group", true))
+                .setFallbackReject()));
+
+    rules.add(
+        new MappingRule(
+            MappingRuleMatchers.createUserMatcher("dave"),
+            (new MappingRuleActions.PlaceToQueueAction(
+                "root.dynamic.%secondary_group.%user", true))
+                .setFallbackReject()));
 
     CSMappingPlacementRule engine = setupEngine(true, rules);
     ApplicationSubmissionContext app = createApp("app");
@@ -437,11 +523,115 @@ public class TestCSMappingPlacementRule {
         "Alice should be placed to root.man.p_alice based on her primary group",
         engine, app, "alice", "root.man.p_alice");
     assertPlace(
-        "Bob should be placed to root.man.developer based on his developer " +
-        "group", engine, app, "bob", "root.man.developer");
-    assertPlace(
-        "Charlie should be placed to root.man.user because he is not a " +
-        "developer nor in the p_alice group", engine, app, "charlie",
-        "root.man.user");
+        "Bob should be placed to root.dynamic.developer.bob based on his " +
+        "secondary group, since we have a queue named 'developer', bob " +
+        "identifies as a user with secondary_group 'developer'", engine, app,
+        "bob", "root.dynamic.developer.bob");
+    assertReject("Charlie should get rejected because he neither of his" +
+        "groups have an ambiguous queue, so effectively he has no secondary " +
+        "group", engine, app, "charlie");
+    assertReject("Dave should get rejected because he has no secondary group",
+        engine, app, "dave");
+  }
+
+  void assertConfigTestResult(List<MappingRule> rules) {
+    assertEquals("We only specified one rule", 1, rules.size());
+    MappingRule rule = rules.get(0);
+    String ruleStr = rule.toString();
+    assertTrue("Rule's matcher variable should be %user",
+        ruleStr.contains("variable='%user'"));
+    assertTrue("Rule's match value should be bob",
+        ruleStr.contains("value='bob'"));
+    assertTrue("Rule's action should be place to queue", ruleStr.contains(
+        "action=PlaceToQueueAction{queueName='%primary_group'"));
+  }
+
+  @Test
+  public void testLegacyConfiguration() throws IOException {
+    CapacitySchedulerConfiguration conf = new CapacitySchedulerConfiguration();
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT,
+        CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT_LEGACY);
+    conf.set(CapacitySchedulerConfiguration.QUEUE_MAPPING,
+        "u:bob:%primary_group");
+
+    List<MappingRule> rules = conf.getMappingRules();
+    assertConfigTestResult(rules);
+  }
+
+  @Test
+  public void testJSONConfiguration() throws IOException {
+    CapacitySchedulerConfiguration conf = new CapacitySchedulerConfiguration();
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT,
+        CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT_JSON);
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_JSON,
+        "{\"rules\": [{" +
+        "    \"type\": \"user\"," +
+        "    \"matches\": \"bob\"," +
+        "    \"policy\": \"custom\"," +
+        "    \"customPlacement\": \"%primary_group\"," +
+        "    \"fallbackResult\":\"skip\"" +
+        "}]}");
+
+    List<MappingRule> rules = conf.getMappingRules();
+    assertConfigTestResult(rules);
+  }
+
+  @Test
+  public void testEmptyJSONConfiguration() throws IOException {
+    CapacitySchedulerConfiguration conf = new CapacitySchedulerConfiguration();
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT,
+        CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT_JSON);
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_JSON, "");
+
+    List<MappingRule> rules = conf.getMappingRules();
+    assertEquals("We expect no rules", 0, rules.size());
+  }
+
+  @Test(expected = IOException.class)
+  public void testInvalidJSONConfiguration() throws IOException {
+    CapacitySchedulerConfiguration conf = new CapacitySchedulerConfiguration();
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT,
+        CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT_JSON);
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_JSON,
+        "I'm a bad JSON, since I'm not a JSON.");
+    List<MappingRule> rules = conf.getMappingRules();
+  }
+
+  @Test(expected = IOException.class)
+  public void testMissingJSONFileConfiguration() throws IOException {
+    CapacitySchedulerConfiguration conf = new CapacitySchedulerConfiguration();
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT,
+        CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT_JSON);
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_JSON_FILE,
+        "/dev/null/nofile");
+    List<MappingRule> rules = conf.getMappingRules();
+  }
+
+  @Test
+  public void testJSONFileConfiguration() throws IOException {
+    CapacitySchedulerConfiguration conf = new CapacitySchedulerConfiguration();
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT,
+        CapacitySchedulerConfiguration.MAPPING_RULE_FORMAT_JSON);
+
+    File jsonFile = folder.newFile("testJSONFileConfiguration.json");
+
+    BufferedWriter writer = new BufferedWriter(new FileWriter(jsonFile));
+    try {
+      writer.write("{\"rules\": [{" +
+          "    \"type\": \"user\"," +
+          "    \"matches\": \"bob\"," +
+          "    \"policy\": \"custom\"," +
+          "    \"customPlacement\": \"%primary_group\"," +
+          "    \"fallbackResult\":\"skip\"" +
+          "}]}");
+    } finally {
+      writer.close();
+    }
+
+    conf.set(CapacitySchedulerConfiguration.MAPPING_RULE_JSON_FILE,
+        jsonFile.getAbsolutePath());
+    List<MappingRule> rules = conf.getMappingRules();
+
+    assertConfigTestResult(rules);
   }
 }
